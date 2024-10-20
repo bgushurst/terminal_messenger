@@ -1,3 +1,4 @@
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -12,14 +13,13 @@ use std::io as err_io;
 use tokio::io::{self};
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 mod app;
 mod ui;
 mod websocket;
-use crate::app::{App, Command, CurrentScreen, MessageType};
+use crate::app::{App, Command, CurrentScreen, LoginField, MessageType};
 use crate::ui::ui;
 use websocket::{connect_to_server, handle_websocket};
 
@@ -83,39 +83,32 @@ async fn run_app<B: Backend>(
     app: &mut App,
     rx: &mut mpsc::Receiver<Event>,
 ) -> io::Result<bool> {
-    // Set app state and Initialize UI
-    app.current_screen = CurrentScreen::LoggingIn;
+    // Set the initial state to ServerSelection
+    app.current_screen = CurrentScreen::ServerSelection;
     terminal
         .draw(|f| ui(f, app))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-    // Specify the server URL to connect to
-    let server_url = Url::parse("ws://autorack.proxy.rlwy.net:55901").unwrap();
-    // ws://127.0.0.1:8080
-
-    // Establish a WebSocket connection with the server
-    let (ws_stream, _) = connect_async(server_url)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    let (mut write, mut read) = ws_stream.split();
-
-    // Initially, set the app state to login
-    app.current_screen = CurrentScreen::LoggingIn;
-
-    // Initialize UI
-    terminal
-        .draw(|f| ui(f, app))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    // Define `write` and `read` as Options, initially set to `None`
+    let mut write: Option<futures_util::stream::SplitSink<websocket::WsStream, Message>> = None;
+    let mut read: Option<futures_util::stream::SplitStream<websocket::WsStream>> = None;
 
     loop {
-        // Use tokio::select! to handle both WebSocket messages and terminal events
         select! {
-            // Handle WebSocket messages in the websocket module
-            ws_res = handle_websocket(app, terminal, &mut write, &mut read) => {
-                if ws_res.is_err() {
-                    log::error!("WebSocket error: {:?}", ws_res.err());
-                    return Ok(false);  // Exit on WebSocket error
+            // Handle WebSocket messages if connection exists
+            ws_res = async {
+                if let (Some(write_ref), Some(read_ref)) = (write.as_mut(), read.as_mut()) {
+                    handle_websocket(app, terminal, write_ref, read_ref).await
+                } else {
+                    Ok(())  // Skip handling if no WebSocket connection exists
+                }
+            }, if write.is_some() && read.is_some() => {
+                if let Err(ws_err) = ws_res {
+                    log::error!("WebSocket error: {:?}", ws_err);
+                    app.current_screen = CurrentScreen::Disconnected;
+                    write = None;  // Set streams to None on disconnection
+                    read = None;
+                    terminal.draw(|f| ui(f, app))?;
                 }
             }
 
@@ -125,20 +118,62 @@ async fn run_app<B: Backend>(
                     if key.kind == KeyEventKind::Release {
                         continue;
                     }
+
                     match app.current_screen {
-                        CurrentScreen::LoggingIn => handle_login_input(key.code, app, &mut write).await?,
+                        CurrentScreen::ServerSelection => {
+                            // Handle server selection input, and connect to the selected server afterward
+                           if handle_server_selection_input(key.code, app, &mut write, &mut read, terminal).await? {
+                                // After the user selects a server, attempt to connect
+                                let ws_stream = connect_to_server(app)
+                                    .await
+                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                                // Split the WebSocket stream into `write` and `read`
+                                let (new_write, new_read) = ws_stream.split();
+                                write = Some(new_write);
+                                read = Some(new_read);
+
+                                // Transition to login screen after connection
+                                app.current_screen = CurrentScreen::LoggingIn;
+                                terminal
+                                    .draw(|f| ui(f, app))
+                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                            }
+                        }
+
+                        // Handle other screens only if WebSocket streams are initialized
+                        CurrentScreen::LoggingIn => {
+                            if let Some(ref mut write_stream) = write {
+                                handle_login_input(key.code, app, write_stream).await?;
+                            }
+                        }
                         CurrentScreen::Main => handle_main_input(key.code, app).await,
-                        CurrentScreen::ComposingMessage => handle_composing_message_input(key.code, app, &mut write).await?,
-                        CurrentScreen::SetUser => handle_set_user_input(key.code, app, &mut write).await?,
+                        CurrentScreen::ComposingMessage => {
+                            if let Some(ref mut write_stream) = write {
+                                handle_composing_message_input(key.code, app, write_stream).await?;
+                            }
+                        }
+                        CurrentScreen::SetUser => {
+                            if let Some(ref mut write_stream) = write {
+                                handle_set_user_input(key.code, app, write_stream).await?;
+                            }
+                        }
                         CurrentScreen::HelpMenu => handle_help_menu_input(key.code, app).await?,
                         CurrentScreen::Exiting => {
                             if handle_exiting_input(key.code, app).await? {
                                 break Ok(false);
                             }
                         }
-                        CurrentScreen::Disconnected =>  handle_disconnected_input(key.code, app, terminal, &mut write, &mut read).await?,
+                        CurrentScreen::ExitingLoggingIn => {
+                            if handle_exiting_logging_in_input(key.code, app).await? {
+                                break Ok(false);
+                            }
+                        }
+                        CurrentScreen::Disconnected => {
+                                handle_disconnected_input(key.code, app, terminal, &mut write, &mut read).await?;
+                        }
+                    }
 
-                                            }
                     terminal.draw(|f| ui(f, app)).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 } else if let Event::Resize(_, _) = event {
                     terminal.draw(|f| ui(f, app)).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -148,50 +183,170 @@ async fn run_app<B: Backend>(
     }
 }
 
-async fn handle_login_input(
+async fn handle_server_selection_input(
     key: KeyCode,
     app: &mut App,
-    write: &mut futures_util::stream::SplitSink<websocket::WsStream, Message>,
-) -> io::Result<()> {
+    write: &mut Option<futures_util::stream::SplitSink<websocket::WsStream, Message>>,
+    read: &mut Option<futures_util::stream::SplitStream<websocket::WsStream>>,
+    terminal: &mut Terminal<impl Backend>,
+) -> io::Result<bool> {
     match key {
         KeyCode::Enter => {
-            // First, set username, then prompt for password
-            if app.username.is_none() {
-                app.username = Some(app.message_input.clone());
-                app.message_input.clear(); // Clear input for password entry
-                app.messages.push(MessageType::SystemMessage(
-                    "Enter your password:".to_string(),
-                ));
-            } else {
-                // Set password and try to authenticate
-                app.password = Some(app.message_input.clone());
+            if let Some(selected_server) = app.servers.get(&app.message_input) {
+                // Disconnect the current WebSocket streams
+                *write = None;
+                *read = None;
+
+                // Establish a new WebSocket connection with the selected server
+                let ws_stream = connect_to_server(app)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                // Split the new WebSocket stream into `write` and `read`
+                let (new_write, new_read) = ws_stream.split();
+                *write = Some(new_write);
+                *read = Some(new_read);
+
+                // Transition to the login screen after connection
+                app.selected_server = Some(app.message_input.clone());
+                app.current_screen = CurrentScreen::LoggingIn;
                 app.message_input.clear();
 
-                // Send authentication request
-                if let (Some(username), Some(password)) = (&app.username, &app.password) {
-                    let auth_message =
-                        MessageType::SystemMessage(format!("{}:{}", username, password));
-                    write
-                        .send(Message::Text(serde_json::to_string(&auth_message).unwrap()))
-                        .await
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                // Reset login input fields
+                app.username = None; // Clear any existing username
+                app.password = None; // Clear any existing password
+                app.current_login_field = LoginField::Username; // Start with the username field
 
-                    // Store username as staging and reset to allow retry if needed
-                    app.staging_username = Some(username.clone());
+                terminal
+                    .draw(|f| ui(f, app))
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+                return Ok(true);
+            } else if app.message_input.contains(':') {
+                // Add a new server if the input contains "name:url"
+                let parts: Vec<&str> = app.message_input.splitn(2, ':').collect();
+                if let Ok(url) = Url::parse(parts[1]) {
+                    app.servers.insert(parts[0].to_string(), url);
                 }
-
-                // Reset username to allow retry
-                app.username = None;
+                app.message_input.clear();
             }
         }
         KeyCode::Backspace => {
-            app.message_input.pop();
+            app.message_input.pop(); // Handle backspace to delete characters
         }
         KeyCode::Char(c) => {
-            app.message_input.push(c);
+            app.message_input.push(c); // Add character to input
+        }
+        KeyCode::Esc => {
+            app.message_input.clear(); // Clear input and stay on the same screen
         }
         _ => {}
     }
+
+    Ok(false) // Return false if no valid server is selected
+}
+
+async fn handle_login_input(
+    key: KeyCode,
+    app: &mut App,
+    write: &mut SplitSink<websocket::WsStream, Message>,
+) -> io::Result<()> {
+    // Handle input based on whether the user is typing
+    if app.is_typing {
+        match key {
+            // Submit the field after typing
+            KeyCode::Enter => {
+                match app.current_login_field {
+                    LoginField::Username => {
+                        if !app.message_input.is_empty() {
+                            app.username = Some(app.message_input.clone());
+                            app.message_input.clear(); // Clear for password input
+                            app.current_login_field = LoginField::Password; // Move to password field
+                            app.is_typing = false; // Stop typing until the user hits Enter again
+                            app.messages.push(MessageType::SystemMessage(
+                                "Enter your password:".to_string(),
+                            ));
+                        }
+                    }
+                    LoginField::Password => {
+                        if !app.message_input.is_empty() {
+                            app.password = Some(app.message_input.clone());
+                            app.message_input.clear();
+
+                            // If both fields are filled, submit the login request
+                            if let (Some(username), Some(password)) = (&app.username, &app.password)
+                            {
+                                let auth_message = MessageType::SystemMessage(format!(
+                                    "{}:{}",
+                                    username, password
+                                ));
+                                write
+                                    .send(Message::Text(
+                                        serde_json::to_string(&auth_message).unwrap(),
+                                    ))
+                                    .await
+                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                                // Store username as staging and reset for a retry if needed
+                                app.staging_username = Some(username.clone());
+                            }
+
+                            // Reset after submission
+                            app.username = None;
+                            app.password = None;
+                            app.current_login_field = LoginField::Username; // Reset to username field
+                            app.is_typing = false; // Stop typing
+                        }
+                    }
+                }
+            }
+
+            // Handle Backspace key press only when typing
+            KeyCode::Backspace => {
+                if !app.message_input.is_empty() {
+                    app.message_input.pop();
+                }
+            }
+
+            // Handle character input while typing
+            KeyCode::Char(c) => {
+                app.message_input.push(c);
+            }
+
+            // Handle Esc key press to stop typing
+            KeyCode::Esc => {
+                // Stop typing when the user presses Esc
+                app.is_typing = false;
+            }
+
+            _ => {}
+        }
+    } else {
+        // When not typing, handle navigation and quitting
+        match key {
+            // Start typing when Enter is pressed
+            KeyCode::Enter => {
+                app.is_typing = true;
+            }
+
+            // Switch between fields using Tab
+            KeyCode::Tab => {
+                app.current_login_field = match app.current_login_field {
+                    LoginField::Username => LoginField::Password,
+                    LoginField::Password => LoginField::Username,
+                };
+            }
+
+            // Quit the application with 'q' when not typing
+            KeyCode::Char('q') => {
+                // Set screen to Exiting
+                app.current_screen = CurrentScreen::ExitingLoggingIn;
+            }
+
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -209,6 +364,11 @@ async fn handle_main_input(key: KeyCode, app: &mut App) {
         }
         KeyCode::Char('n') => {
             app.current_screen = CurrentScreen::SetUser;
+        }
+        KeyCode::Char('s') => {
+            // Transition to server selection screen
+            app.current_screen = CurrentScreen::ServerSelection;
+            app.message_input.clear();
         }
         KeyCode::Up => app.scroll_up(),
         KeyCode::Down => app.scroll_down(),
@@ -302,23 +462,33 @@ async fn handle_disconnected_input(
     key: KeyCode,
     app: &mut App,
     terminal: &mut Terminal<impl Backend>,
-    write: &mut futures_util::stream::SplitSink<websocket::WsStream, Message>,
-    read: &mut futures_util::stream::SplitStream<websocket::WsStream>,
+    write: &mut Option<futures_util::stream::SplitSink<websocket::WsStream, Message>>,
+    read: &mut Option<futures_util::stream::SplitStream<websocket::WsStream>>,
 ) -> io::Result<()> {
     match key {
         KeyCode::Char('r') => {
-            // Attempt to reconnect
-            if let Ok(new_stream) = connect_to_server().await {
+            // Attempt to reconnect to the selected server
+            if let Ok(new_stream) = connect_to_server(app).await {
                 let (new_write, new_read) = new_stream.split();
-                *write = new_write;
-                *read = new_read;
+                *write = Some(new_write); // Update the WebSocket streams after reconnecting
+                *read = Some(new_read);
 
-                // Clear terminal and force a full redraw
+                // Clear the terminal and return to the login screen for re-authentication
                 terminal.clear()?;
-                app.current_screen = CurrentScreen::Main;
+                app.current_screen = CurrentScreen::LoggingIn; // Transition to the login screen
+                terminal.draw(|f| ui(f, app))?;
+            } else {
+                // Handle connection failure, push a system message to the app
+                app.messages.push(MessageType::SystemMessage(
+                    "Reconnection failed. Please check the server.".to_string(),
+                ));
+                terminal.draw(|f| ui(f, app))?;
             }
         }
-        KeyCode::Char('q') => return Ok(()), // Exit the app
+        KeyCode::Char('q') => {
+            // Return `Ok(false)` to signal quitting the app
+            return Ok(());
+        }
         _ => {}
     }
     Ok(())
@@ -377,6 +547,19 @@ async fn handle_exiting_input(key: KeyCode, app: &mut App) -> io::Result<bool> {
         }
         KeyCode::Char('n') | KeyCode::Char('q') => {
             app.current_screen = CurrentScreen::Main;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn handle_exiting_logging_in_input(key: KeyCode, app: &mut App) -> io::Result<bool> {
+    match key {
+        KeyCode::Char('y') => {
+            return Ok(true); // Exit the app
+        }
+        KeyCode::Char('n') | KeyCode::Char('q') => {
+            app.current_screen = CurrentScreen::LoggingIn;
         }
         _ => {}
     }

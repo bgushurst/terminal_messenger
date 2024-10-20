@@ -1,27 +1,33 @@
-use crate::app::{App, MessageType};
-use futures_util::{SinkExt, StreamExt};
+use crate::app::App;
+use futures_util::StreamExt;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
-use std::error::Error;
 use tokio::io;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use url::Url;
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-// Connect to the server and return the WebSocket stream
-pub async fn connect_to_server() -> Result<WsStream, Box<dyn Error>> {
-    let server_url = Url::parse("ws://autorack.proxy.rlwy.net:55901")?;
-    let (ws_stream, _) = connect_async(server_url).await?;
-    Ok(ws_stream)
+pub async fn connect_to_server(
+    app: &App,
+) -> Result<WsStream, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(server_name) = &app.selected_server {
+        if let Some(server_url) = app.servers.get(server_name) {
+            let (ws_stream, _) = connect_async(server_url.clone()).await?;
+            return Ok(ws_stream);
+        }
+    }
+    Err(Box::new(io::Error::new(
+        io::ErrorKind::NotFound,
+        "No server selected",
+    )))
 }
 
 // Handle WebSocket messages in a separate module
 pub async fn handle_websocket<B: Backend>(
     app: &mut App,
     terminal: &mut Terminal<B>,
-    write: &mut futures_util::stream::SplitSink<WsStream, Message>,
+    _write: &mut futures_util::stream::SplitSink<WsStream, Message>,
     read: &mut futures_util::stream::SplitStream<WsStream>,
 ) -> io::Result<()> {
     loop {

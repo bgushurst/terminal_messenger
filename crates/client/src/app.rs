@@ -1,5 +1,6 @@
-//use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use url::Url;
 
 pub enum CurrentScreen {
     Main,
@@ -9,6 +10,8 @@ pub enum CurrentScreen {
     Exiting,
     Disconnected,
     LoggingIn,
+    ExitingLoggingIn,
+    ServerSelection,
 }
 
 pub enum Command {
@@ -17,6 +20,11 @@ pub enum Command {
     DirectMessage(String, String), // recipient, message
     Help,
     Unknown(String),
+}
+
+pub enum LoginField {
+    Username,
+    Password,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -35,11 +43,26 @@ pub struct App {
     pub messages: Vec<MessageType>,
     pub scroll_offset: usize,
     pub compose_scroll_offset: usize,
-    pub failed_login_attempts: u8, // keep track of failed logins
+    pub failed_login_attempts: u8,       // keep track of failed logins
+    pub current_login_field: LoginField, // track current input on login
+    pub is_typing: bool,                 // track if user is typing
+    pub servers: HashMap<String, Url>,   // storing servers
+    pub selected_server: Option<String>, // Track the selected server
 }
 
 impl App {
     pub fn new() -> App {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "local".to_string(),
+            Url::parse("ws://0.0.0.0:8080").unwrap(),
+        );
+        servers.insert(
+            "default".to_string(),
+            Url::parse("ws://autorack.proxy.rlwy.net:55901").unwrap(),
+        );
+        let selected_server = Some("default".to_string());
+
         App {
             username: None, // Start without a username
             staging_username: None,
@@ -50,6 +73,10 @@ impl App {
             scroll_offset: 0,
             compose_scroll_offset: 0,
             failed_login_attempts: 0,
+            current_login_field: LoginField::Username, // Default value
+            is_typing: false,
+            servers,
+            selected_server,
         }
     }
 

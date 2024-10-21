@@ -19,7 +19,6 @@ pub struct UserInfo {
     pub username: String,
     pub connection_time: SystemTime,
     pub message_count: usize,
-    pub color: String,
 }
 
 pub struct UserCredentials {
@@ -75,7 +74,6 @@ impl App {
             username,
             connection_time: SystemTime::now(),
             message_count: 0,
-            color: "default".to_string(),
         }));
         self.connected_users.insert(user_id.clone(), user_info);
     }
@@ -122,7 +120,6 @@ impl UserInfo {
             username: "username".to_string(),
             connection_time: SystemTime::now(),
             message_count: 0,
-            color: "default".to_string(),
         }
     }
 }

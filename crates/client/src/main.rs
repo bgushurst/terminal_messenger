@@ -20,9 +20,10 @@ mod app;
 mod ui;
 mod websocket;
 use crate::app::{App, Command, CurrentScreen, LoginField, MessageType};
+use crate::event::MouseEvent;
+use crate::event::MouseEventKind;
 use crate::ui::ui;
 use websocket::{connect_to_server, handle_websocket};
-
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -124,25 +125,16 @@ async fn run_app<B: Backend>(
                             // Handle server selection input, and connect to the selected server afterward
                            if handle_server_selection_input(key.code, app, &mut write, &mut read, terminal).await? {
                                 // After the user selects a server, attempt to connect
-                                let ws_stream = connect_to_server(app)
-                                    .await
-                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-                                // Split the WebSocket stream into `write` and `read`
-                                let (new_write, new_read) = ws_stream.split();
-                                write = Some(new_write);
-                                read = Some(new_read);
-
-                                // Transition to login screen after connection
-                                app.current_screen = CurrentScreen::LoggingIn;
-                                terminal
-                                    .draw(|f| ui(f, app))
-                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                             }
+                        }
+                        CurrentScreen::AddServer => {
+                           handle_add_server_input(key.code, app).await?;
                         }
 
                         // Handle other screens only if WebSocket streams are initialized
                         CurrentScreen::LoggingIn => {
+
                             if let Some(ref mut write_stream) = write {
                                 handle_login_input(key.code, app, write_stream).await?;
                             }
@@ -183,46 +175,10 @@ async fn run_app<B: Backend>(
     }
 }
 
-async fn handle_server_selection_input(
-    key: KeyCode,
-    app: &mut App,
-    write: &mut Option<futures_util::stream::SplitSink<websocket::WsStream, Message>>,
-    read: &mut Option<futures_util::stream::SplitStream<websocket::WsStream>>,
-    terminal: &mut Terminal<impl Backend>,
-) -> io::Result<bool> {
+async fn handle_add_server_input(key: KeyCode, app: &mut App) -> io::Result<bool> {
     match key {
         KeyCode::Enter => {
-            if let Some(selected_server) = app.servers.get(&app.message_input) {
-                // Disconnect the current WebSocket streams
-                *write = None;
-                *read = None;
-
-                // Establish a new WebSocket connection with the selected server
-                let ws_stream = connect_to_server(app)
-                    .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-                // Split the new WebSocket stream into `write` and `read`
-                let (new_write, new_read) = ws_stream.split();
-                *write = Some(new_write);
-                *read = Some(new_read);
-
-                // Transition to the login screen after connection
-                app.selected_server = Some(app.message_input.clone());
-                app.current_screen = CurrentScreen::LoggingIn;
-                app.message_input.clear();
-
-                // Reset login input fields
-                app.username = None; // Clear any existing username
-                app.password = None; // Clear any existing password
-                app.current_login_field = LoginField::Username; // Start with the username field
-
-                terminal
-                    .draw(|f| ui(f, app))
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-                return Ok(true);
-            } else if app.message_input.contains(':') {
+            if app.message_input.contains(':') {
                 // Add a new server if the input contains "name:url"
                 let parts: Vec<&str> = app.message_input.splitn(2, ':').collect();
                 if let Ok(url) = Url::parse(parts[1]) {
@@ -238,8 +194,145 @@ async fn handle_server_selection_input(
             app.message_input.push(c); // Add character to input
         }
         KeyCode::Esc => {
-            app.message_input.clear(); // Clear input and stay on the same screen
+            app.current_screen = CurrentScreen::ServerSelection; // Cancel add_server input and go back
         }
+
+        _ => {}
+    }
+
+    Ok(false) // Return false if no valid server is selected
+}
+
+async fn handle_server_selection_input(
+    key: KeyCode,
+    app: &mut App,
+    write: &mut Option<futures_util::stream::SplitSink<websocket::WsStream, Message>>,
+    read: &mut Option<futures_util::stream::SplitStream<websocket::WsStream>>,
+    terminal: &mut Terminal<impl Backend>,
+) -> io::Result<bool> {
+    match key {
+        KeyCode::Enter => {
+            if let Some(selected_server) = app.servers.get(app.selected_server.as_ref().unwrap()) {
+                // Disconnect the current WebSocket streams
+                *write = None;
+                *read = None;
+
+                // Establish a new WebSocket connection with the selected server
+                let ws_stream = connect_to_server(app)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                // Split the new WebSocket stream into `write` and `read`
+                let (new_write, new_read) = ws_stream.split();
+                *write = Some(new_write);
+                *read = Some(new_read);
+
+                // Transition to the login screen after connection
+                app.current_screen = CurrentScreen::LoggingIn;
+                app.message_input.clear();
+
+                // Reset login input fields
+                app.username = None; // Clear any existing username
+                app.password = None; // Clear any existing password
+                app.current_login_field = LoginField::Username; // Start with the username field
+
+                terminal
+                    .draw(|f| ui(f, app))
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+                return Ok(true);
+            }
+        }
+
+        KeyCode::Up => {
+            if let Some(selected_server) = &app.selected_server {
+                let server_names: Vec<&String> = app.servers.keys().collect();
+
+                for (i, name) in server_names.iter().enumerate() {
+                    if *name == selected_server {
+                        if i > 0 {
+                            let new_selected_server_name =
+                                server_names.get(i - 1).expect("Failed to get server name");
+                            app.selected_server = Some(new_selected_server_name.to_string());
+                            break;
+                        }
+                    }
+                }
+            } else {
+                if let Some(first_server_name) = app.servers.keys().next() {
+                    app.selected_server = Some(first_server_name.to_string());
+                }
+            }
+        }
+
+        KeyCode::Down => {
+            if let Some(selected_server) = &app.selected_server {
+                let server_names: Vec<&String> = app.servers.keys().collect();
+
+                for (i, name) in server_names.iter().enumerate() {
+                    if *name == selected_server {
+                        if i < app.servers.len() - 1 {
+                            let new_selected_server_name =
+                                server_names.get(i + 1).expect("Failed to get server name");
+                            app.selected_server = Some(new_selected_server_name.to_string());
+                            break;
+                        }
+                    }
+                }
+            } else {
+                if let Some(first_server_name) = app.servers.keys().next() {
+                    app.selected_server = Some(first_server_name.to_string());
+                }
+            }
+        }
+
+        KeyCode::Char('n') => {
+            app.current_screen = CurrentScreen::AddServer; // Transition to add server screen
+            app.message_input.clear(); // Clear any input
+
+            terminal
+                .draw(|f| ui(f, app))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            //return Ok(true);
+        }
+        KeyCode::Esc => {
+            if write.is_some() && read.is_some() {
+                // Check if there is an active server connection
+                app.current_screen = CurrentScreen::Main; // Transition to the main screen
+                app.message_input.clear(); // Clear any input
+
+                terminal
+                    .draw(|f| ui(f, app))
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+                return Ok(true);
+            } else {
+                // If no active connection exists, clear input and stay on server selection screen
+                app.message_input.clear();
+            }
+        }
+        KeyCode::Tab => {
+            if let Some(selected_server) = &app.selected_server {
+                let server_names: Vec<&String> = app.servers.keys().collect();
+                let current_index = server_names
+                    .iter()
+                    .position(|name| *name == selected_server);
+
+                if let Some(index) = current_index {
+                    let next_index = (index + 1) % app.servers.len();
+                    let new_selected_server_name = server_names
+                        .get(next_index)
+                        .expect("Failed to get server name");
+                    app.selected_server = Some(new_selected_server_name.to_string());
+                } else if let Some(first_server_name) = app.servers.keys().next() {
+                    app.selected_server = Some(first_server_name.to_string());
+                }
+            } else if let Some(first_server_name) = app.servers.keys().next() {
+                app.selected_server = Some(first_server_name.to_string());
+            }
+        }
+
         _ => {}
     }
 
@@ -436,11 +529,11 @@ async fn handle_composing_message_input(
             app.current_screen = CurrentScreen::Main;
             return Ok(());
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::PageUp => {
             app.compose_scroll_up();
             return Ok(());
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::PageDown => {
             app.compose_scroll_down();
             return Ok(());
         }
@@ -455,6 +548,7 @@ async fn handle_composing_message_input(
         KeyCode::Char(c) => app.message_input.push(c),
         _ => {}
     }
+
     Ok(())
 }
 
